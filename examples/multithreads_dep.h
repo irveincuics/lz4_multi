@@ -3,6 +3,7 @@
 //
 #include "lz4.h"
 #include <lz4frame.h>
+#include <iostream>
 #include <exception>
 #include <vector>
 #include <thread>
@@ -19,8 +20,12 @@ using namespace std;
 class Consumer {
   public:
     // 构造函数，初始化输出缓冲区和上下文大小
-    Consumer(size_t max_output_size)
-        : output_buffer_(max_output_size), output_size_(0), previous_size_(0) {}
+    Consumer(size_t initial_output_size)
+        : output_buffer_(initial_output_size), output_size_(0), previous_size_(0) {}
+    // 获取完整的解压缩数据
+    const std::vector<char>& get_full_output() const {
+        return output_buffer_;
+    }
 
     // 获取输出缓冲区指针，用于解压线程填充数据
     char* get_output_buffer() {
@@ -36,9 +41,9 @@ class Consumer {
     void write_output(const char* output, size_t size) {
         std::lock_guard<std::mutex> lock(mtx_);
 
-        // 检查是否有足够的空间
+        // 如果空间不足，扩展缓冲区
         if (output_size_ + size > output_buffer_.size()) {
-            throw std::runtime_error("Output buffer overflow");
+            expand_buffer(output_size_ + size - output_buffer_.size());
         }
 
         // 拷贝解压缩后的数据到输出缓冲区
@@ -78,6 +83,12 @@ class Consumer {
     }
 
   private:
+    // 扩展输出缓冲区的大小
+    void expand_buffer(size_t additional_size) {
+        size_t new_size = output_buffer_.size() + std::max(additional_size, output_buffer_.size() / 2);
+        output_buffer_.resize(new_size);
+    }
+
     std::vector<char> output_buffer_; // 输出缓冲区
     size_t output_size_;              // 当前输出数据大小
     size_t previous_size_;            // 最近一次解压缩的数据大小（用于上下文）
@@ -89,22 +100,29 @@ class Consumer {
 template<typename Consumer>
 static void lz4_decompress_with_context(const byte* in, size_t in_size, unsigned nthreads, Consumer& consumer) {
     std::vector<std::thread> threads;
-    std::vector<LZ4_streamDecode_t*> lz4_contexts(nthreads);
+    std::vector<LZ4F_decompressionContext_t> lz4_contexts(nthreads);
     std::atomic<size_t> nready = {0};
     std::condition_variable ready;
     std::mutex ready_mtx;
     std::exception_ptr exception;
 
-    // 初始化 LZ4 解码上下文
+    // 初始化 LZ4F 解码上下文
     for (unsigned i = 0; i < nthreads; i++) {
-        lz4_contexts[i] = LZ4_createStreamDecode();
-        if (!lz4_contexts[i]) throw std::runtime_error("Failed to create LZ4 decode context");
+        size_t result = LZ4F_createDecompressionContext(&lz4_contexts[i], LZ4F_VERSION);
+        if (LZ4F_isError(result)) {
+            throw std::runtime_error("Failed to create LZ4F decompression context: " + std::string(LZ4F_getErrorName(result)));
+        }
     }
 
     // 分块大小设置
     size_t chunk_size = in_size / nthreads;
-    size_t first_chunk_size = chunk_size + (4UL << 20); // 前 4MB 为第一个线程分配更多的数据
-    chunk_size = (in_size - first_chunk_size) / (nthreads - 1);
+    size_t first_chunk_size = std::min(chunk_size + (4UL << 20), in_size); // 第一个块最多为输入大小
+    chunk_size = (in_size - first_chunk_size) / (nthreads > 1 ? (nthreads - 1) : 1);
+
+    std::cout << "Input size: " << in_size
+              << ", Threads: " << nthreads
+              << ", First chunk size: " << first_chunk_size
+              << ", Chunk size: " << chunk_size << std::endl;
 
     for (unsigned chunk_idx = 0; chunk_idx < nthreads; chunk_idx++) {
         threads.emplace_back([&, chunk_idx]() {
@@ -112,32 +130,77 @@ static void lz4_decompress_with_context(const byte* in, size_t in_size, unsigned
                 const byte* start = in + (chunk_idx == 0 ? 0 : first_chunk_size + chunk_size * (chunk_idx - 1));
                 const byte* stop = start + (chunk_idx == 0 ? first_chunk_size : chunk_size);
 
-                // 初始化上下文
+            // 防止 stop 超出 in_size
+                stop = (stop > in + in_size) ? in + in_size : stop;
+
+                std::cout << "Thread " << chunk_idx
+                          << ": start=" << (start - in)
+                          << ", stop=" << (stop - in)
+                          << ", size=" << (stop - start) << std::endl;
+
+            // 获取当前线程的解压上下文
+                LZ4F_decompressionContext_t& dctx = lz4_contexts[chunk_idx];
+                size_t src_size = stop - start;
+                const char* src = (const char*)start;
+
+            // 使用上一个线程的后64KB作为字典
                 if (chunk_idx > 0) {
-                    // 使用前一个线程的上下文作为初始字典
                     const byte* prev_output = static_cast<const byte*>(consumer.get_previous_output());
                     size_t prev_size = consumer.get_previous_size();
-                    LZ4_setStreamDecode(lz4_contexts[chunk_idx], (const char*)prev_output, prev_size);
+                    size_t dict_size = std::min(prev_size, static_cast<size_t>(64 * 1024));
+                // 直接将字典作为输入
+                    const char* prev_output_char = reinterpret_cast<const char*>(prev_output);
+
+                // LZ4F解压时不需要显式的字典加载，只需在每个块解压前提供字典
+                    size_t result = LZ4F_decompress(dctx, nullptr, nullptr, prev_output_char + prev_size - dict_size, &dict_size, nullptr);
+                    if (LZ4F_isError(result)) {
+                        throw std::runtime_error("Failed to use dictionary: " + std::string(LZ4F_getErrorName(result)));
+                    }
                 }
 
-                // 解压缩数据块
-                char* output = (char*)consumer.get_output_buffer();
-                int decompressed_size = LZ4_decompress_safe_continue(
-                    lz4_contexts[chunk_idx],
-                    (const char*)start,
-                    output,
-                    stop - start,
-                    consumer.get_output_size());
+            // 逐块解压
+                while (src_size > 0) {
+                    char* output = (char*)consumer.get_output_buffer();
+                    size_t dst_size = consumer.get_output_size();
 
-                if (decompressed_size < 0) {
-                    throw std::runtime_error("LZ4 decompression failed");
+                    size_t src_consumed = src_size;
+
+                    size_t result = LZ4F_decompress(dctx, output, &dst_size, src, &src_consumed, nullptr);
+                    if (LZ4F_isError(result)) {
+                        throw std::runtime_error("LZ4F decompression failed: " + std::string(LZ4F_getErrorName(result)));
+                    }
+
+                    std::cout << "Thread " << chunk_idx
+                              << " decompressed " << dst_size
+                              << " bytes, consumed " << src_consumed
+                              << " bytes of input." << std::endl;
+
+                    consumer.write_output(output, dst_size);
+
+                    src += src_consumed;
+                    src_size -= src_consumed;
+
+                    if (result == 0) {
+                    // 解压完成
+                        break;
+                    }
                 }
 
-                // 直接调用 consumer 处理输出数据
-                consumer.write_output(output, decompressed_size);
+            // 保存当前线程的后64KB作为字典供下一个线程使用
+                if (src_size == 0) {
+                    const byte* last_output = static_cast<const byte*>(consumer.get_previous_output());
+                    size_t last_size = consumer.get_previous_size();
+                    size_t dict_size = std::min(last_size, static_cast<size_t>(64 * 1024));
+                    // 显式转换 std::byte* 到 const char*
+                    const char* prev_output_char = reinterpret_cast<const char*>(last_output);
+                    consumer.save_context(prev_output_char + last_size - dict_size, dict_size);
+                }
 
-                // 保存上下文信息供下一个线程使用
-                consumer.save_context(output, decompressed_size);
+                {
+                    std::unique_lock<std::mutex> lock{ready_mtx};
+                    nready++;
+                    ready.notify_all();
+                }
             } catch (...) {
                 std::unique_lock<std::mutex> lock{ready_mtx};
                 if (!exception) {
@@ -145,12 +208,6 @@ static void lz4_decompress_with_context(const byte* in, size_t in_size, unsigned
                     nready = 0; // 停止线程池
                 }
                 return;
-            }
-
-            {
-                std::unique_lock<std::mutex> lock{ready_mtx};
-                nready++;
-                ready.notify_all();
             }
         });
     }
@@ -162,10 +219,7 @@ static void lz4_decompress_with_context(const byte* in, size_t in_size, unsigned
     // 处理异常
     if (exception) { std::rethrow_exception(exception); }
 
-    // 释放 LZ4 解码上下文
-    for (auto ctx : lz4_contexts)
-        LZ4_freeStreamDecode(ctx);
+    // 释放 LZ4F 解码上下文
+    for (auto& dctx : lz4_contexts)
+        LZ4F_freeDecompressionContext(dctx);
 }
-
-
-
