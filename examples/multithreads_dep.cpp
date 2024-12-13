@@ -72,14 +72,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-// 解压后保存到文件
+    // 解压后保存到文件
     std::ofstream output_file(output_filename, std::ios::binary);
     if (!output_file.is_open()) {
         std::cerr << "Failed to open output file." << std::endl;
         return 1;
     }
 
-// 获取完整解压数据并写入
+    // 获取完整解压数据并写入
     const auto& decompressed_data = consumer.get_full_output();
     output_file.write(decompressed_data.data(), decompressed_data.size());
     output_file.close();
